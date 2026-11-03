@@ -1,7 +1,9 @@
 // PCの再生音をWASAPIループバックで取り込み、16bit PCM に変換してUDPで送信する
 using System.Buffers.Binary;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using LanAudio.Shared;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
 namespace LanAudio.Sender;
@@ -12,7 +14,7 @@ public sealed class SenderEngine : IDisposable
     static readonly Guid FloatGuid = new("00000003-0000-0010-8000-00aa00389b71");
 
     readonly UdpClient udp;
-    readonly WasapiLoopbackCapture capture;   // 既定の再生デバイスの音を取り込む
+    readonly LowLatencyLoopbackCapture capture;   // 既定の再生デバイスの音を取り込む
     readonly bool isFloat;
     readonly int outCh, sampleRate, bytesPerSample, inFrameBytes, outFrameBytes, chunkBytes;
     readonly byte[] packet = new byte[AudioPacket.HeaderSize + AudioPacket.MaxPayload];
@@ -20,6 +22,13 @@ public sealed class SenderEngine : IDisposable
     uint seq;
     long sentPackets, lastSendTicks, lastErrorTicks = long.MinValue / 2;
     volatile bool disposing;
+    bool timerPeriodSet;
+
+    /// <summary>キャプチャのバッファ長(ms)。NAudio 既定の 100ms だと約50msごとのまとめ送りになり遅延が大きい</summary>
+    const int CaptureBufferMs = 20;
+
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint uPeriod);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint uPeriod);
 
     public string Destination { get; }
     /// <summary>送信フォーマット（"48000Hz 2ch 16bit"）</summary>
@@ -40,7 +49,7 @@ public sealed class SenderEngine : IDisposable
         try
         {
             udp.Connect(host, port);
-            capture = new WasapiLoopbackCapture();
+            capture = new LowLatencyLoopbackCapture(CaptureBufferMs);
         }
         catch
         {
@@ -61,6 +70,8 @@ public sealed class SenderEngine : IDisposable
 
         capture.DataAvailable += OnDataAvailable;
         capture.RecordingStopped += (_, e) => { if (!disposing) Stopped?.Invoke(e.Exception); };
+        // ポーリング間隔(約10ms)が Thread.Sleep の既定分解能(15.6ms)に丸められないようにする
+        timerPeriodSet = timeBeginPeriod(1) == 0;
         try
         {
             capture.StartRecording();
@@ -77,10 +88,12 @@ public sealed class SenderEngine : IDisposable
         disposing = true;
         capture.Dispose();
         udp.Dispose();
+        if (timerPeriodSet) { timeEndPeriod(1); timerPeriodSet = false; }
     }
 
     void OnDataAvailable(object? sender, WaveInEventArgs e)
     {
+        AudioThreadPriority.EnsureCurrentThread();   // NAudio の取り込みスレッドで呼ばれる
         int frames = e.BytesRecorded / inFrameBytes;
         if (frames == 0) return;
         int outBytes = frames * outFrameBytes;
@@ -139,4 +152,18 @@ public sealed class SenderEngine : IDisposable
             _ => 0
         };
     }
+}
+
+/// <summary>
+/// バッファ長を指定できるループバックキャプチャ（ポーリング方式）。
+/// NAudio の WasapiLoopbackCapture はバッファ長が 100ms 固定のため自前で用意する。
+/// </summary>
+sealed class LowLatencyLoopbackCapture : WasapiCapture
+{
+    public LowLatencyLoopbackCapture(int bufferMs)
+        : base(new MMDeviceEnumerator().GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia), false, bufferMs)
+    {
+    }
+
+    protected override AudioClientStreamFlags GetAudioClientStreamFlags() => AudioClientStreamFlags.Loopback;
 }
