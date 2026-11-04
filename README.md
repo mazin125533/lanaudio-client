@@ -32,3 +32,9 @@ PCの再生音を WASAPI ループバックで取り込み、16bit PCM に変換
 
 ## パケット形式
 `src/AudioPacket.cs` 参照（サーバー側と同じファイル。変更する場合は両方そろえる）。
+
+## ライセンス
+
+[MIT License](LICENSE)。自由に使用・改変・再配布できます。
+
+音声処理に [NAudio](https://github.com/naudio/NAudio)（MIT License）を使用しています。
